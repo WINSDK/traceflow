@@ -1,9 +1,9 @@
-use nix::Error;
 use nix::libc::{self, siginfo_t, user_regs_struct};
 use nix::sys::ptrace::Options;
 use nix::sys::ptrace::{Request, RequestType};
 use nix::sys::signal::Signal;
 use nix::unistd::{fork, ForkResult, Pid};
+use nix::Error;
 use nix::Result;
 
 use std::convert::Infallible;
@@ -23,6 +23,7 @@ struct PtraceRequest {
 }
 
 impl PtraceRequest {
+    #[inline]
     unsafe fn other(self) -> c_long {
         let ret = libc::ptrace(
             self.ty as RequestType,
@@ -38,16 +39,15 @@ impl PtraceRequest {
         }
     }
 
+    #[inline]
     unsafe fn peek(self) -> c_long {
-        let ret = unsafe {
-            Error::clear();
-            libc::ptrace(
-                self.ty as RequestType,
-                libc::pid_t::from(self.pid),
-                self.addr,
-                self.data,
-            )
-        };
+        Error::clear();
+        let ret = libc::ptrace(
+            self.ty as RequestType,
+            libc::pid_t::from(self.pid),
+            self.addr,
+            self.data,
+        );
 
         if ret == -1 {
             let errno = Error::last();
@@ -64,7 +64,9 @@ impl PtraceRequest {
 
     fn execute(self) -> c_long {
         match self.ty {
-            Request::PTRACE_PEEKDATA | Request::PTRACE_PEEKUSER => unsafe { self.peek() },
+            Request::PTRACE_PEEKDATA | Request::PTRACE_PEEKUSER | Request::PTRACE_SETSIGINFO => {
+                unsafe { self.peek() }
+            },
             _ => unsafe { self.other() },
         }
     }
@@ -81,7 +83,7 @@ pub struct Tracer {
 }
 
 impl Tracer {
-    pub fn new() -> Self {
+    pub fn spawn() -> Self {
         let (reqs_sendr, reqs_recv) = mpsc::channel::<RemoteRequest>();
         let ress = Arc::new((Mutex::new(c_long::MIN), Condvar::new()));
 
@@ -233,7 +235,7 @@ impl Tracer {
         })
         .map(drop)
     }
-    
+
     /// Reads a word from a user area at `offset`, as with ptrace(PTRACE_PEEKUSER, ...).
     /// The user struct definition can be found in `/usr/include/sys/user.h`.
     pub fn read_user(&self, pid: Pid, offset: AddressType) -> Result<c_long> {
@@ -244,7 +246,7 @@ impl Tracer {
             data: 0,
         })
     }
-    
+
     /// Writes a word to a user area at `offset`, as with ptrace(PTRACE_POKEUSER, ...).
     /// The user struct definition can be found in `/usr/include/sys/user.h`.
     ///
@@ -263,32 +265,27 @@ impl Tracer {
             pid,
             addr: offset,
             data: data as usize,
-        }).map(drop)
+        })
+        .map(drop)
     }
 
     /// Get user registers, as with `ptrace(PTRACE_GETREGS, ...)`
     #[cfg(all(
         target_os = "linux",
         any(
-            all(
-                target_arch = "x86_64",
-                any(target_env = "gnu", target_env = "musl")
-            ),
+            all(target_arch = "x86_64", any(target_env = "gnu", target_env = "musl")),
             all(target_arch = "x86", target_env = "gnu")
         )
     ))]
     pub fn getregs(&self, pid: Pid) -> Result<user_regs_struct> {
         self.ptrace_get_data::<user_regs_struct>(Request::PTRACE_GETREGS, pid)
     }
-    
+
     /// Set user registers, as with `ptrace(PTRACE_SETREGS, ...)`
     #[cfg(all(
         target_os = "linux",
         any(
-            all(
-                target_arch = "x86_64",
-                any(target_env = "gnu", target_env = "musl")
-            ),
+            all(target_arch = "x86_64", any(target_env = "gnu", target_env = "musl")),
             all(target_arch = "x86", target_env = "gnu")
         )
     ))]
@@ -298,9 +295,10 @@ impl Tracer {
             pid,
             addr: 0,
             data: &regs as *const _ as usize,
-        }).map(drop)
+        })
+        .map(drop)
     }
-    
+
     /// Function for ptrace requests that return values from the data field.
     /// Some ptrace get requests populate structs or larger elements than `c_long`
     /// and therefore use the data field to return values. This function handles these
@@ -315,7 +313,7 @@ impl Tracer {
         })?;
         Ok(unsafe { data.assume_init() })
     }
-    
+
     /// Set options, as with `ptrace(PTRACE_SETOPTIONS, ...)`.
     pub fn setoptions(&self, pid: Pid, options: Options) -> Result<()> {
         self.send(PtraceRequest {
@@ -323,30 +321,31 @@ impl Tracer {
             pid,
             addr: 0,
             data: options.bits() as usize,
-        }).map(drop)
+        })
+        .map(drop)
     }
-    
+
     /// Gets a ptrace event as described by `ptrace(PTRACE_GETEVENTMSG, ...)`
     pub fn getevent(&self, pid: Pid) -> Result<c_long> {
         self.ptrace_get_data::<c_long>(Request::PTRACE_GETEVENTMSG, pid)
     }
-    
+
     /// Get siginfo as with `ptrace(PTRACE_GETSIGINFO, ...)`
     pub fn getsiginfo(&self, pid: Pid) -> Result<siginfo_t> {
         self.ptrace_get_data::<siginfo_t>(Request::PTRACE_GETSIGINFO, pid)
     }
-    
+
     /// Set siginfo as with `ptrace(PTRACE_SETSIGINFO, ...)`
     pub fn setsiginfo(&self, pid: Pid, sig: &siginfo_t) -> Result<()> {
-        // NOTE: This might require calling Errno::clear() first, not sure about it.
         self.send(PtraceRequest {
             ty: Request::PTRACE_SETSIGINFO,
             pid,
             addr: 0,
             data: sig as *const siginfo_t as usize,
-        }).map(drop)
+        })
+        .map(drop)
     }
-    
+
     /// Continue execution until the next syscall, as with `ptrace(PTRACE_SYSEMU, ...)`
     ///
     /// In contrast to the `syscall` function, the syscall stopped at will not be executed.
@@ -367,9 +366,10 @@ impl Tracer {
             pid,
             addr: 0,
             data,
-        }).map(drop)
+        })
+        .map(drop)
     }
-    
+
     /// Attach to a running process, as with `ptrace(PTRACE_ATTACH, ...)`
     ///
     /// Attaches to the process specified by `pid`, making it a tracee of the calling process.
@@ -379,9 +379,10 @@ impl Tracer {
             pid,
             addr: 0,
             data: 0,
-        }).map(drop)
+        })
+        .map(drop)
     }
-    
+
     /// Attach to a running process, as with `ptrace(PTRACE_SEIZE, ...)`
     ///
     /// Attaches to the process specified in pid, making it a tracee of the calling process.
@@ -392,9 +393,10 @@ impl Tracer {
             pid,
             addr: 0,
             data: options.bits() as usize,
-        }).map(drop)
+        })
+        .map(drop)
     }
-    
+
     /// Detaches the current running process, as with `ptrace(PTRACE_DETACH, ...)`
     ///
     /// Detaches from the process specified by `pid` allowing it to run freely, optionally
@@ -409,9 +411,10 @@ impl Tracer {
             pid,
             addr: 0,
             data,
-        }).map(drop)
+        })
+        .map(drop)
     }
-    
+
     /// Stop a tracee, as with `ptrace(PTRACE_INTERRUPT, ...)`
     ///
     /// This request is equivalent to `ptrace(PTRACE_INTERRUPT, ...)`
@@ -422,9 +425,10 @@ impl Tracer {
             pid,
             addr: 0,
             data: 0,
-        }).map(drop)
+        })
+        .map(drop)
     }
-    
+
     /// Issues a kill request as with `ptrace(PTRACE_KILL, ...)`
     ///
     /// This request is equivalent to `ptrace(PTRACE_CONT, ..., SIGKILL);`
@@ -434,9 +438,10 @@ impl Tracer {
             pid,
             addr: 0,
             data: 0,
-        }).map(drop)
+        })
+        .map(drop)
     }
-    
+
     /// Move the stopped tracee process forward by a single step as with
     /// `ptrace(PTRACE_SINGLESTEP, ...)`
     ///
@@ -470,9 +475,10 @@ impl Tracer {
             pid,
             addr: 0,
             data,
-        }).map(drop)
+        })
+        .map(drop)
     }
-    
+
     /// Move the stopped tracee process forward by a single step or stop at the next syscall
     /// as with `ptrace(PTRACE_SYSEMU_SINGLESTEP, ...)`
     ///
@@ -494,6 +500,7 @@ impl Tracer {
             pid,
             addr: 0,
             data,
-        }).map(drop)
+        })
+        .map(drop)
     }
 }

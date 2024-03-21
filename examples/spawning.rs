@@ -131,7 +131,7 @@ fn main_loop(tracer: &Arc<Tracer>, pid: Pid) -> Result<(), nix::Error> {
 }
 
 fn main() -> Result<(), nix::Error> {
-    let tracer = Arc::new(Tracer::new());
+    let tracer = Arc::new(Tracer::spawn());
     let pid = spawn(&tracer, "./loop")?;
     println!("pid: {pid}");
 
