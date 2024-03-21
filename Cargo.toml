@@ -4,4 +4,4 @@ version = "1.0.0"
 edition = "2021"
 
 [dependencies]
-nix = { git = "https://github.com/WINSDK/nix" }
+nix = "0.28"
