@@ -102,6 +102,14 @@ fn main_loop(tracer: &Arc<Tracer>, pid: Pid) -> Result<(), nix::Error> {
         std::thread::spawn(move || -> Result<(), nix::Error> {
             let mut buf = String::new();
 
+            let mut regs = tracer.getregs(pid)?;
+            let new_rip = 0x123456789;
+            regs.rip = new_rip;
+            tracer.setregs(pid, regs)?;
+            if tracer.getregs(pid)?.rip == new_rip {
+                println!("settings registers works!!!");
+            }
+
             print!("address to read: ");
             std::io::stdout().flush().unwrap();
 
