@@ -114,10 +114,11 @@ impl Tracer {
     }
 
     fn send(&self, req: PtraceRequest) -> Result<c_long> {
-        self.reqs.send(RemoteRequest::Ptrace(req)).unwrap();
-
         let (lock, cvar) = &*self.result;
         let mut lock = lock.lock().unwrap();
+
+        self.reqs.send(RemoteRequest::Ptrace(req)).unwrap();
+
         while *lock == c_long::MIN {
             lock = cvar.wait(lock).unwrap();
         }
@@ -133,10 +134,11 @@ impl Tracer {
     }
 
     pub fn fork(&self, child: Box<ChildCB>) -> Result<Pid> {
-        self.reqs.send(RemoteRequest::Fork(child)).unwrap();
-
         let (lock, cvar) = &*self.result;
         let mut lock = lock.lock().unwrap();
+
+        self.reqs.send(RemoteRequest::Fork(child)).unwrap();
+
         while *lock == c_long::MIN {
             lock = cvar.wait(lock).unwrap();
         }
