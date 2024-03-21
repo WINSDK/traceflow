@@ -1,4 +1,5 @@
 use std::io::Write;
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::sync::Arc;
 use std::{ffi::CString, path::Path};
 
@@ -20,19 +21,20 @@ fn spawn<P: AsRef<Path>>(tracer: &Tracer, path: P) -> Result<Pid, nix::Error> {
 
     // Create a communication pipe for error handling.
     let (pipe_read, pipe_write) = nix::unistd::pipe()?;
+    let (pipe_read, pipe_write) = (pipe_read.as_raw_fd(), pipe_write.as_raw_fd());
 
     // Tell write pipe to close on exec (required for checking successful execution).
-    fcntl(pipe_write, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
+    fcntl(pipe_write.as_raw_fd(), FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
 
     let child = move || unsafe {
         let _ = nix::unistd::close(pipe_read);
 
-        let report_error = |err| {
+        let report_error = move |err| {
             // Convert error to bytes.
             let errno = (err as i32).to_ne_bytes();
 
             // Write error status to pipe.
-            let _ = nix::unistd::write(pipe_write, &errno);
+            let _ = nix::unistd::write(std::mem::transmute::<_, BorrowedFd>(pipe_write), &errno);
 
             // Explicitly close the write end of the pipe to ensure the parent can read EOF
             // if exec hasn't been called.
@@ -69,11 +71,11 @@ fn spawn<P: AsRef<Path>>(tracer: &Tracer, path: P) -> Result<Pid, nix::Error> {
     let _ = nix::unistd::close(pipe_write);
 
     let mut errno = [0; 4];
-    match nix::unistd::read(pipe_read, &mut errno) {
+    match nix::unistd::read(pipe_read.as_raw_fd(), &mut errno) {
         // Child ran into error.
         Ok(4) => {
             let errno = i32::from_ne_bytes(errno);
-            let errno = nix::Error::from_i32(errno);
+            let errno = nix::Error::from_raw(errno);
             return Err(errno);
         }
         // Child ran successfully.

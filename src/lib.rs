@@ -1,4 +1,4 @@
-use nix::errno::Errno;
+use nix::Error;
 use nix::libc;
 use nix::sys::ptrace::{Request, RequestType};
 use nix::sys::signal::Signal;
@@ -31,7 +31,7 @@ impl PtraceRequest {
         );
 
         if ret == -1 {
-            -(nix::errno::errno() as c_long)
+            -(Error::last() as c_long)
         } else {
             ret
         }
@@ -39,7 +39,7 @@ impl PtraceRequest {
 
     unsafe fn peek(self) -> c_long {
         let ret = unsafe {
-            Errno::clear();
+            Error::clear();
             libc::ptrace(
                 self.ty as RequestType,
                 libc::pid_t::from(self.pid),
@@ -49,12 +49,12 @@ impl PtraceRequest {
         };
 
         if ret == -1 {
-            let errno = nix::errno::errno();
+            let errno = Error::last();
 
-            if errno == Errno::UnknownErrno as i32 {
+            if errno == Error::UnknownErrno {
                 ret
             } else {
-                -errno as c_long
+                -(errno as c_long)
             }
         } else {
             ret
@@ -126,7 +126,7 @@ impl Tracer {
         *lock = c_long::MIN;
 
         if result < 0 {
-            Err(Errno::from_i32(-result as i32))
+            Err(Error::from_raw(-result as i32))
         } else {
             Ok(result)
         }
@@ -145,7 +145,7 @@ impl Tracer {
         *lock = c_long::MIN;
 
         if result < 0 {
-            Err(Errno::from_i32(-result as i32))
+            Err(Error::from_raw(-result as i32))
         } else {
             Ok(Pid::from_raw(result as i32))
         }
@@ -163,6 +163,25 @@ impl Tracer {
 
         self.send(PtraceRequest {
             ty: Request::PTRACE_CONT,
+            pid,
+            addr: 0,
+            data,
+        })
+        .map(drop)
+    }
+
+    /// Continue execution until the next syscall, as with `ptrace(PTRACE_SYSCALL, ...)`
+    ///
+    /// Arranges for the tracee to be stopped at the next entry to or exit from a system call,
+    /// optionally delivering a signal specified by `sig`.
+    pub fn syscall<T: Into<Option<Signal>>>(&self, pid: Pid, sig: T) -> Result<()> {
+        let data = match sig.into() {
+            Some(s) => s as i32 as usize,
+            None => 0,
+        };
+
+        self.send(PtraceRequest {
+            ty: Request::PTRACE_SYSCALL,
             pid,
             addr: 0,
             data,

@@ -4,4 +4,4 @@ version = "1.0.0"
 edition = "2021"
 
 [dependencies]
-nix = "0.28"
+nix = { version = "0.28", features = ["ptrace", "sched", "personality", "signal", "fs"] }
