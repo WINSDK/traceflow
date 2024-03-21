@@ -1,0 +1,10 @@
+traceflow
+=====
+
+Multithreaded tracer using ptrace.
+Removes limitation of only being able to run ptrace commands from
+the parent that called fork().
+
+To run the example:
+* clang ./examples/loop.c -o ./loop
+* cargo run --example spawning
