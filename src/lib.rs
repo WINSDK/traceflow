@@ -8,12 +8,11 @@ use nix::Result;
 
 use std::convert::Infallible;
 use std::ffi::{c_long, c_void};
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 
 type AddressType = usize;
 type Data = usize;
-type ChildCB = dyn FnOnce() -> Infallible + Send + 'static;
 
 struct PtraceRequest {
     ty: Request,
@@ -64,6 +63,9 @@ impl PtraceRequest {
 
     fn execute(self) -> c_long {
         match self.ty {
+            // Some ptrace requests appear to require clearing the errno.
+            // That's why we have this slightly different method.
+            // It's identical to nix::sys::ptrace::ptrace_peek(..).
             Request::PTRACE_PEEKDATA | Request::PTRACE_PEEKUSER | Request::PTRACE_SETSIGINFO => {
                 unsafe { self.peek() }
             },
@@ -72,63 +74,85 @@ impl PtraceRequest {
     }
 }
 
+type ChildCB = Box<dyn FnOnce() -> Infallible + Send + 'static>;
+
+struct ForkRequest {
+    callback: ChildCB,
+}
+
+impl ForkRequest {
+    fn execute(self) -> c_long {
+        match unsafe { fork() } {
+            Err(err) => -(err as c_long),
+            Ok(ForkResult::Child) => {
+                (self.callback)();
+                unreachable!()
+            }
+            Ok(ForkResult::Parent { child }) => child.as_raw() as c_long,
+        }
+    }
+}
+
 enum RemoteRequest {
-    Fork(Box<ChildCB>),
+    Fork(ForkRequest),
     Ptrace(PtraceRequest),
 }
 
+type RemoteResult = Arc<(Mutex<c_long>, Condvar)>;
+
 pub struct Tracer {
     reqs: Sender<RemoteRequest>,
-    result: Arc<(Mutex<c_long>, Condvar)>,
+    result: RemoteResult,
+}
+
+fn tracer_thread(requests: Receiver<RemoteRequest>, result: RemoteResult) {
+    // Wait for any requests
+    for req in requests {
+        let res = match req {
+            RemoteRequest::Fork(req) => req.execute(),
+            RemoteRequest::Ptrace(req) => req.execute(),
+        };
+
+        // Set result and notify calling thread about the change.
+        let (lock, cvar) = &*result;
+        *lock.lock().unwrap() = res;
+        cvar.notify_all();
+    }
 }
 
 impl Tracer {
     pub fn spawn() -> Self {
-        let (reqs_sendr, reqs_recv) = mpsc::channel::<RemoteRequest>();
-        let ress = Arc::new((Mutex::new(c_long::MIN), Condvar::new()));
+        let (reqs_sendr, reqs_recv) = mpsc::channel();
+        let result = Arc::new((Mutex::new(c_long::MIN), Condvar::new()));
 
-        let cress = Arc::clone(&ress);
-        std::thread::spawn(move || {
-            for req in reqs_recv {
-                let result = match req {
-                    RemoteRequest::Fork(callback) => match unsafe { fork() } {
-                        Err(err) => err as c_long,
-                        Ok(res) => match res {
-                            ForkResult::Child => {
-                                callback();
-                                unreachable!();
-                            }
-                            ForkResult::Parent { child } => child.as_raw() as c_long,
-                        },
-                    },
-                    RemoteRequest::Ptrace(req) => req.execute(),
-                };
-
-                let (lock, cvar) = &*cress;
-                *lock.lock().unwrap() = result;
-                cvar.notify_all();
-            }
-        });
+        let tresult = Arc::clone(&result);
+        std::thread::spawn(move || tracer_thread(reqs_recv, tresult));
 
         Self {
             reqs: reqs_sendr,
-            result: ress,
+            result,
         }
     }
 
-    fn send(&self, req: PtraceRequest) -> Result<c_long> {
+    #[inline]
+    fn send_request(&self, req: RemoteRequest) -> Result<c_long> {
+        // Lock result value so only this thread can send requests and receive results.
         let (lock, cvar) = &*self.result;
         let mut lock = lock.lock().unwrap();
 
-        self.reqs.send(RemoteRequest::Ptrace(req)).unwrap();
+        // Send request to tracer thread.
+        self.reqs.send(req).unwrap();
 
+        // Wait for result to be set.
         while *lock == c_long::MIN {
             lock = cvar.wait(lock).unwrap();
         }
 
+        // Store code and unset result.
         let result = *lock;
         *lock = c_long::MIN;
 
+        // Convert negatives code's to errors.
         if result < 0 {
             Err(Error::from_raw(-result as i32))
         } else {
@@ -136,24 +160,13 @@ impl Tracer {
         }
     }
 
-    pub fn fork(&self, child: Box<ChildCB>) -> Result<Pid> {
-        let (lock, cvar) = &*self.result;
-        let mut lock = lock.lock().unwrap();
+    fn ptrace(&self, req: PtraceRequest) -> Result<c_long> {
+        self.send_request(RemoteRequest::Ptrace(req))
+    }
 
-        self.reqs.send(RemoteRequest::Fork(child)).unwrap();
-
-        while *lock == c_long::MIN {
-            lock = cvar.wait(lock).unwrap();
-        }
-
-        let result = *lock;
-        *lock = c_long::MIN;
-
-        if result < 0 {
-            Err(Error::from_raw(-result as i32))
-        } else {
-            Ok(Pid::from_raw(result as i32))
-        }
+    pub unsafe fn fork(&self, child: ChildCB) -> Result<Pid> {
+        self.send_request(RemoteRequest::Fork(ForkRequest { callback: child }))
+            .map(|res| Pid::from_raw(res as i32))
     }
 
     /// Restart the stopped tracee process, as with `ptrace(PTRACE_CONT, ...)`
@@ -166,7 +179,7 @@ impl Tracer {
             None => 0,
         };
 
-        self.send(PtraceRequest {
+        self.ptrace(PtraceRequest {
             ty: Request::PTRACE_CONT,
             pid,
             addr: 0,
@@ -185,7 +198,7 @@ impl Tracer {
             None => 0,
         };
 
-        self.send(PtraceRequest {
+        self.ptrace(PtraceRequest {
             ty: Request::PTRACE_SYSCALL,
             pid,
             addr: 0,
@@ -199,7 +212,7 @@ impl Tracer {
     /// Indicates that this process is to be traced by its parent.
     /// This is the only ptrace request to be issued by the tracee.
     pub fn traceme(&self) -> Result<()> {
-        self.send(PtraceRequest {
+        self.ptrace(PtraceRequest {
             ty: Request::PTRACE_TRACEME,
             pid: Pid::from_raw(0),
             addr: 0,
@@ -211,7 +224,7 @@ impl Tracer {
     /// Reads a word from a processes memory at the given address, as with
     /// ptrace(PTRACE_PEEKDATA, ...)
     pub fn read(&self, pid: Pid, addr: AddressType) -> Result<c_long> {
-        self.send(PtraceRequest {
+        self.ptrace(PtraceRequest {
             ty: Request::PTRACE_PEEKDATA,
             pid,
             addr,
@@ -227,7 +240,7 @@ impl Tracer {
     /// The `data` argument is passed directly to `ptrace(2)`.  Read that man page
     /// for guidance.
     pub unsafe fn write(&self, pid: Pid, addr: AddressType, data: *mut c_void) -> Result<()> {
-        self.send(PtraceRequest {
+        self.ptrace(PtraceRequest {
             ty: Request::PTRACE_POKEDATA,
             pid,
             addr,
@@ -239,7 +252,7 @@ impl Tracer {
     /// Reads a word from a user area at `offset`, as with ptrace(PTRACE_PEEKUSER, ...).
     /// The user struct definition can be found in `/usr/include/sys/user.h`.
     pub fn read_user(&self, pid: Pid, offset: AddressType) -> Result<c_long> {
-        self.send(PtraceRequest {
+        self.ptrace(PtraceRequest {
             ty: Request::PTRACE_PEEKUSER,
             pid,
             addr: offset,
@@ -260,7 +273,7 @@ impl Tracer {
         offset: AddressType,
         data: *mut c_void,
     ) -> Result<()> {
-        self.send(PtraceRequest {
+        self.ptrace(PtraceRequest {
             ty: Request::PTRACE_POKEUSER,
             pid,
             addr: offset,
@@ -290,7 +303,7 @@ impl Tracer {
         )
     ))]
     pub fn setregs(&self, pid: Pid, regs: user_regs_struct) -> Result<()> {
-        self.send(PtraceRequest {
+        self.ptrace(PtraceRequest {
             ty: Request::PTRACE_SETREGS,
             pid,
             addr: 0,
@@ -305,7 +318,7 @@ impl Tracer {
     /// requests.
     fn ptrace_get_data<T>(&self, request: Request, pid: Pid) -> Result<T> {
         let mut data = std::mem::MaybeUninit::<T>::uninit();
-        self.send(PtraceRequest {
+        self.ptrace(PtraceRequest {
             ty: request,
             pid,
             addr: 0,
@@ -316,7 +329,7 @@ impl Tracer {
 
     /// Set options, as with `ptrace(PTRACE_SETOPTIONS, ...)`.
     pub fn setoptions(&self, pid: Pid, options: Options) -> Result<()> {
-        self.send(PtraceRequest {
+        self.ptrace(PtraceRequest {
             ty: Request::PTRACE_SETOPTIONS,
             pid,
             addr: 0,
@@ -337,7 +350,7 @@ impl Tracer {
 
     /// Set siginfo as with `ptrace(PTRACE_SETSIGINFO, ...)`
     pub fn setsiginfo(&self, pid: Pid, sig: &siginfo_t) -> Result<()> {
-        self.send(PtraceRequest {
+        self.ptrace(PtraceRequest {
             ty: Request::PTRACE_SETSIGINFO,
             pid,
             addr: 0,
@@ -361,7 +374,7 @@ impl Tracer {
             Some(s) => s as i32 as usize,
             None => 0,
         };
-        self.send(PtraceRequest {
+        self.ptrace(PtraceRequest {
             ty: Request::PTRACE_SYSEMU,
             pid,
             addr: 0,
@@ -374,7 +387,7 @@ impl Tracer {
     ///
     /// Attaches to the process specified by `pid`, making it a tracee of the calling process.
     pub fn attach(&self, pid: Pid) -> Result<()> {
-        self.send(PtraceRequest {
+        self.ptrace(PtraceRequest {
             ty: Request::PTRACE_ATTACH,
             pid,
             addr: 0,
@@ -388,7 +401,7 @@ impl Tracer {
     /// Attaches to the process specified in pid, making it a tracee of the calling process.
     #[cfg(target_os = "linux")]
     pub fn seize(&self, pid: Pid, options: Options) -> Result<()> {
-        self.send(PtraceRequest {
+        self.ptrace(PtraceRequest {
             ty: Request::PTRACE_SEIZE,
             pid,
             addr: 0,
@@ -406,7 +419,7 @@ impl Tracer {
             Some(s) => s as i32 as usize,
             None => 0,
         };
-        self.send(PtraceRequest {
+        self.ptrace(PtraceRequest {
             ty: Request::PTRACE_DETACH,
             pid,
             addr: 0,
@@ -420,7 +433,7 @@ impl Tracer {
     /// This request is equivalent to `ptrace(PTRACE_INTERRUPT, ...)`
     #[cfg(target_os = "linux")]
     pub fn interrupt(&self, pid: Pid) -> Result<()> {
-        self.send(PtraceRequest {
+        self.ptrace(PtraceRequest {
             ty: Request::PTRACE_INTERRUPT,
             pid,
             addr: 0,
@@ -433,7 +446,7 @@ impl Tracer {
     ///
     /// This request is equivalent to `ptrace(PTRACE_CONT, ..., SIGKILL);`
     pub fn kill(&self, pid: Pid) -> Result<()> {
-        self.send(PtraceRequest {
+        self.ptrace(PtraceRequest {
             ty: Request::PTRACE_KILL,
             pid,
             addr: 0,
@@ -470,7 +483,7 @@ impl Tracer {
             Some(s) => s as i32 as usize,
             None => 0,
         };
-        self.send(PtraceRequest {
+        self.ptrace(PtraceRequest {
             ty: Request::PTRACE_SINGLESTEP,
             pid,
             addr: 0,
@@ -495,7 +508,7 @@ impl Tracer {
             Some(s) => s as i32 as usize,
             None => 0,
         };
-        self.send(PtraceRequest {
+        self.ptrace(PtraceRequest {
             ty: Request::PTRACE_SYSEMU_SINGLESTEP,
             pid,
             addr: 0,

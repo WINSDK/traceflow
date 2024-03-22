@@ -67,7 +67,7 @@ fn spawn<P: AsRef<Path>>(tracer: &Tracer, path: P) -> Result<Pid, nix::Error> {
         std::hint::unreachable_unchecked();
     };
 
-    let child = tracer.fork(Box::new(child))?;
+    let child = unsafe { tracer.fork(Box::new(child))? };
     let _ = nix::unistd::close(pipe_write);
 
     let mut errno = [0; 4];
